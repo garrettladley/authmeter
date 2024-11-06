@@ -148,7 +148,6 @@ func TestMultipleKeyAuth(t *testing.T) {
 			return c.OriginalURL() != "/auth1"
 		},
 		KeyAuthConfig: KeyAuthConfig{
-
 			KeyLookup: "header:key",
 			Validator: func(c *fiber.Ctx, key string) (bool, error) {
 				if key == "password1" {
@@ -281,7 +280,6 @@ func TestCustomSuccessAndFailureHandlers(t *testing.T) {
 
 	app.Use(New(Config{
 		KeyAuthConfig: KeyAuthConfig{
-
 			SuccessHandler: func(c *fiber.Ctx) error {
 				return c.Status(fiber.StatusOK).SendString("API key is valid and request was handled by custom success handler")
 			},

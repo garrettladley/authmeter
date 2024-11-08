@@ -6,6 +6,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/gofiber/storage/memory"
 )
 
 // Config defines the config for middleware.
@@ -14,24 +15,26 @@ type Config struct {
 	// Optional. Default: nil
 	Next func(*fiber.Ctx) bool
 
-	LimitConfig
+	// SuccessHandler defines a function which is executed for a valid key.
+	// Optional. Default: nil
+	SuccessHandler fiber.Handler
+
+	// ErrorHandler defines a function which is executed for an invalid key.
+	// It may be used to define a custom error.
+	// Optional. Default: 401 Invalid or expired key
+	ErrorHandler fiber.ErrorHandler
+
+	LimiterConfig
 	CreditConfig
 	ScopeConfig
 	KeyAuthConfig
 }
 
-type LimitConfig struct {
+type LimiterConfig struct {
 	// Max number of recent connections during `Expiration` seconds before sending a 429 response
 	//
 	// Default: 5
 	Max int
-
-	// KeyGenerator allows you to generate custom keys, by default c.IP() is used
-	//
-	// Default: func(c *fiber.Ctx) string {
-	//   return c.IP()
-	// }
-	KeyGenerator func(*fiber.Ctx) string
 
 	// Expiration is the time on how long to keep records of requests in memory
 	//
@@ -66,10 +69,29 @@ type LimitConfig struct {
 	LimiterMiddleware limiter.LimiterHandler
 }
 
+func (l *LimiterConfig) into(kg func(*fiber.Ctx) string) limiter.Config {
+	return limiter.Config{
+		Max:                    l.Max,
+		KeyGenerator:           kg,
+		Expiration:             l.Expiration,
+		LimitReached:           l.LimitReached,
+		SkipFailedRequests:     l.SkipFailedRequests,
+		SkipSuccessfulRequests: l.SkipSuccessfulRequests,
+		Storage:                l.Storage,
+		LimiterMiddleware:      l.LimiterMiddleware,
+	}
+}
+
 type CreditConfig struct {
 	Storage fiber.Storage
 
-	GetCredits func(fiber.Storage, string) (int, error)
+	// AllowDebt defines if a user is allowed to go into debt.
+	// If cost > balance, the user will be denied access.
+	AllowDebt bool
+
+	GetCreditCost func(*fiber.Ctx, fiber.Storage) (int, error)
+
+	GetCreditBalance func(fiber.Storage, string) (int, error)
 
 	DeductCredits func(fiber.Storage, string, int) error
 }
@@ -81,15 +103,6 @@ type ScopeConfig struct {
 }
 
 type KeyAuthConfig struct {
-	// SuccessHandler defines a function which is executed for a valid key.
-	// Optional. Default: nil
-	SuccessHandler fiber.Handler
-
-	// ErrorHandler defines a function which is executed for an invalid key.
-	// It may be used to define a custom error.
-	// Optional. Default: 401 Invalid or expired key
-	ErrorHandler fiber.ErrorHandler
-
 	// KeyLookup is a string in the form of "<source>:<name>" that is used
 	// to extract key from the request.
 	// Optional. Default value "header:Authorization".
@@ -115,16 +128,16 @@ type KeyAuthConfig struct {
 
 // ConfigDefault is the default config
 var ConfigDefault = Config{
+	SuccessHandler: func(c *fiber.Ctx) error {
+		return c.Next()
+	},
+	ErrorHandler: func(c *fiber.Ctx, err error) error {
+		if errors.Is(err, ErrMissingOrMalformedAPIKey) {
+			return c.Status(fiber.StatusUnauthorized).SendString(err.Error())
+		}
+		return c.Status(fiber.StatusUnauthorized).SendString("Invalid or expired API Key")
+	},
 	KeyAuthConfig: KeyAuthConfig{
-		SuccessHandler: func(c *fiber.Ctx) error {
-			return c.Next()
-		},
-		ErrorHandler: func(c *fiber.Ctx, err error) error {
-			if errors.Is(err, ErrMissingOrMalformedAPIKey) {
-				return c.Status(fiber.StatusUnauthorized).SendString(err.Error())
-			}
-			return c.Status(fiber.StatusUnauthorized).SendString("Invalid or expired API Key")
-		},
 		KeyLookup:  "header:" + fiber.HeaderAuthorization,
 		AuthScheme: "Bearer",
 		ContextKey: "token",
@@ -136,12 +149,10 @@ var ConfigDefault = Config{
 	// TODO
 	ScopeConfig: ScopeConfig{},
 
-	LimitConfig: LimitConfig{
+	// MARK: remove key generator field from limiter config?
+	LimiterConfig: LimiterConfig{
 		Max:        5,
 		Expiration: 1 * time.Minute,
-		KeyGenerator: func(c *fiber.Ctx) string {
-			return c.IP()
-		},
 		LimitReached: func(c *fiber.Ctx) error {
 			return c.SendStatus(fiber.StatusTooManyRequests)
 		},
@@ -153,23 +164,78 @@ var ConfigDefault = Config{
 
 // Helper function to set default values
 func configDefault(config ...Config) Config {
-	// Return default config if nothing provided
+	// return default config if nothing provided
 	if len(config) < 1 {
 		return ConfigDefault
 	}
 
-	// Override default config
+	// override default config
 	cfg := config[0]
 
-	// Set default values
-
-	// keyauth
+	// set default values
 	if cfg.SuccessHandler == nil {
 		cfg.SuccessHandler = ConfigDefault.SuccessHandler
 	}
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = ConfigDefault.ErrorHandler
 	}
+
+	defaulters := []func(*Config){
+		limiterDefault,
+		creditDefault,
+		keyAuthDefault,
+	}
+
+	for _, defaulter := range defaulters {
+		defaulter(&cfg)
+	}
+
+	return cfg
+}
+
+func limiterDefault(cfg *Config) {
+	if cfg.Next == nil {
+		cfg.Next = ConfigDefault.Next
+	}
+	if cfg.Max <= 0 {
+		cfg.Max = ConfigDefault.Max
+	}
+	if int(cfg.Expiration.Seconds()) <= 0 {
+		cfg.Expiration = ConfigDefault.Expiration
+	}
+	if cfg.LimitReached == nil {
+		cfg.LimitReached = ConfigDefault.LimitReached
+	}
+	if cfg.LimiterMiddleware == nil {
+		cfg.LimiterMiddleware = ConfigDefault.LimiterMiddleware
+	}
+}
+
+func creditDefault(cfg *Config) {
+	if cfg.CreditConfig.Storage == nil {
+		cfg.CreditConfig.Storage = memory.New()
+	}
+	if cfg.GetCreditCost == nil {
+		panic("fiber: authmeter middleware requires a GetCreditCost function")
+	}
+	if cfg.GetCreditBalance == nil {
+		panic("fiber: authmeter middleware requires a GetCreditBalance function")
+	}
+	if cfg.DeductCredits == nil {
+		panic("fiber: authmeter middleware requires a DeductCredits function")
+	}
+}
+
+func scopeDefault(cfg *Config) {
+	if cfg.ScopeConfig.Storage == nil {
+		cfg.ScopeConfig.Storage = memory.New()
+	}
+	if cfg.ScopeConfig.Allow == nil {
+		panic("fiber: authmeter middleware requires a Allow function")
+	}
+}
+
+func keyAuthDefault(cfg *Config) {
 	if cfg.KeyLookup == "" {
 		cfg.KeyLookup = ConfigDefault.KeyLookup
 		// set AuthScheme as "Bearer" only if KeyLookup is set to default.
@@ -183,30 +249,4 @@ func configDefault(config ...Config) Config {
 	if cfg.ContextKey == nil {
 		cfg.ContextKey = ConfigDefault.ContextKey
 	}
-
-	// TODO: credit
-	//
-	// TODO: scope
-
-	// limit
-	if cfg.Next == nil {
-		cfg.Next = ConfigDefault.Next
-	}
-	if cfg.Max <= 0 {
-		cfg.Max = ConfigDefault.Max
-	}
-	if int(cfg.Expiration.Seconds()) <= 0 {
-		cfg.Expiration = ConfigDefault.Expiration
-	}
-	if cfg.KeyGenerator == nil {
-		cfg.KeyGenerator = ConfigDefault.KeyGenerator
-	}
-	if cfg.LimitReached == nil {
-		cfg.LimitReached = ConfigDefault.LimitReached
-	}
-	if cfg.LimiterMiddleware == nil {
-		cfg.LimiterMiddleware = ConfigDefault.LimiterMiddleware
-	}
-
-	return cfg
 }

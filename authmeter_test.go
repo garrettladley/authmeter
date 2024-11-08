@@ -279,13 +279,13 @@ func TestCustomSuccessAndFailureHandlers(t *testing.T) {
 	app := fiber.New()
 
 	app.Use(New(Config{
+		SuccessHandler: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusOK).SendString("API key is valid and request was handled by custom success handler")
+		},
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			return c.Status(fiber.StatusUnauthorized).SendString("API key is invalid and request was handled by custom error handler")
+		},
 		KeyAuthConfig: KeyAuthConfig{
-			SuccessHandler: func(c *fiber.Ctx) error {
-				return c.Status(fiber.StatusOK).SendString("API key is valid and request was handled by custom success handler")
-			},
-			ErrorHandler: func(c *fiber.Ctx, err error) error {
-				return c.Status(fiber.StatusUnauthorized).SendString("API key is invalid and request was handled by custom error handler")
-			},
 			Validator: func(c *fiber.Ctx, key string) (bool, error) {
 				if key == CorrectKey {
 					return true, nil

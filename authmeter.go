@@ -8,8 +8,12 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-// When there is no request of the key thrown ErrMissingOrMalformedAPIKey
-var ErrMissingOrMalformedAPIKey = errors.New("missing or malformed API Key")
+var (
+	ErrAPIKeyNotAllowed = errors.New("api key not allowed to access this resource")
+	ErrCreditsExceeded  = errors.New("credits exceeded")
+	// When there is no request of the key thrown ErrMissingOrMalformedAPIKey
+	ErrMissingOrMalformedAPIKey = errors.New("missing or malformed API Key")
+)
 
 const (
 	query  = "query"
@@ -36,26 +40,65 @@ func New(config ...Config) fiber.Handler {
 		extractor = keyFromCookie(parts[1])
 	}
 
-	// Return middleware handler
+	infallibleExtractor := func(c *fiber.Ctx) string {
+		key, err := extractor(c)
+		if err != nil {
+			return ""
+		}
+		return key
+	}
+
+	limiter := cfg.LimiterConfig.LimiterMiddleware.New(cfg.LimiterConfig.into(infallibleExtractor))
+
 	return func(c *fiber.Ctx) error {
-		// Filter request to skip middleware
 		if cfg.Next != nil && cfg.Next(c) {
 			return c.Next()
 		}
 
-		// Extract and verify key
+		if err := limiter(c); err != nil {
+			return cfg.ErrorHandler(c, err)
+		}
+
 		key, err := extractor(c)
 		if err != nil {
 			return cfg.ErrorHandler(c, err)
 		}
 
 		valid, err := cfg.Validator(c, key)
-
-		if err == nil && valid {
-			c.Locals(cfg.ContextKey, key)
-			return cfg.SuccessHandler(c)
+		if err != nil {
+			return cfg.ErrorHandler(c, err)
 		}
-		return cfg.ErrorHandler(c, err)
+		if valid {
+			c.Locals(cfg.ContextKey, key)
+		}
+
+		allowed, err := cfg.Allow(c, cfg.ScopeConfig.Storage, key)
+		if err != nil {
+			return cfg.ErrorHandler(c, err)
+		}
+		if !allowed {
+			return cfg.ErrorHandler(c, ErrAPIKeyNotAllowed)
+		}
+
+		cost, err := cfg.GetCreditCost(c, cfg.CreditConfig.Storage)
+		if err != nil {
+			return cfg.ErrorHandler(c, err)
+		}
+
+		balance, err := cfg.GetCreditBalance(cfg.CreditConfig.Storage, key)
+		if err != nil {
+			return cfg.ErrorHandler(c, err)
+		}
+
+		if !cfg.AllowDebt && (balance < 0 || balance < cost) {
+			return cfg.ErrorHandler(c, ErrCreditsExceeded)
+		}
+
+		if err := cfg.DeductCredits(cfg.CreditConfig.Storage, key, cost); err != nil {
+			return cfg.ErrorHandler(c, err)
+		}
+
+		return cfg.SuccessHandler(c)
 	}
 }
 
